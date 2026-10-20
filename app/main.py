@@ -1,29 +1,51 @@
 from __future__ import annotations
 
-import base64
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 
+import jwt
 import urllib3
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-LEGACY_SECRET = "WORKSHOP_SECRET_2026"
+JWT_ISSUER = os.getenv("AUTH_JWT_ISSUER", "workshop-auth")
+JWT_AUDIENCE = os.getenv("AUTH_JWT_AUDIENCE", "workshop-requirements-api")
 
 
 def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token or " " in token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    public_key_path = os.getenv("AUTH_JWT_PUBLIC_KEY_PATH")
+    if not public_key_path:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
-        parts = decoded.split("|")
-        if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
-            raise ValueError("invalid token")
-        return {"username": parts[0], "role": parts[1]}
-    except Exception as error:
-        raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
+        public_key = Path(public_key_path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise HTTPException(status_code=503, detail="Authentication is not configured") from error
+
+    try:
+        claims = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": ["sub", "groups", "iat", "exp"]},
+        )
+        username = claims.get("sub")
+        groups = claims.get("groups")
+        if not isinstance(username, str) or not username:
+            raise jwt.InvalidTokenError("invalid subject")
+        if not isinstance(groups, list) or not groups or not all(isinstance(role, str) and role for role in groups):
+            raise jwt.InvalidTokenError("invalid groups")
+        return {"username": username, "role": groups[0]}
+    except jwt.PyJWTError as error:
+        raise HTTPException(status_code=401, detail="Invalid token") from error
 
 
 def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
