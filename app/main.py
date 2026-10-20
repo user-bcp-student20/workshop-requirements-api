@@ -1,29 +1,51 @@
 from __future__ import annotations
 
-import base64
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 
+import jwt
 import urllib3
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-LEGACY_SECRET = "WORKSHOP_SECRET_2026"
+JWT_ISSUER = os.getenv("AUTH_JWT_ISSUER", "workshop-auth")
+JWT_AUDIENCE = os.getenv("AUTH_JWT_AUDIENCE", "workshop-requirements-api")
 
 
-def legacy_identity(authorization: str = Header(default="")) -> dict[str, str]:
+def verified_identity(authorization: str = Header(default="")) -> dict[str, str]:
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token or " " in token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    public_key_path = os.getenv("AUTH_JWT_PUBLIC_KEY_PATH")
+    if not public_key_path:
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+
     try:
-        token = authorization.replace("Bearer ", "")
-        decoded = base64.b64decode(token).decode("utf-8")
-        parts = decoded.split("|")
-        if len(parts) != 4 or parts[3] != LEGACY_SECRET or int(parts[2]) < int(time.time()):
-            raise ValueError("invalid token")
-        return {"username": parts[0], "role": parts[1]}
-    except Exception as error:
-        raise HTTPException(status_code=401, detail="Invalid token: " + str(error)) from error
+        public_key = Path(public_key_path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise HTTPException(status_code=503, detail="Authentication is not configured") from error
+
+    try:
+        claims = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": ["sub", "groups", "iat", "exp"]},
+        )
+        username = claims.get("sub")
+        groups = claims.get("groups")
+        if not isinstance(username, str) or not username:
+            raise jwt.InvalidTokenError("invalid subject")
+        if not isinstance(groups, list) or not groups or not all(isinstance(role, str) and role for role in groups):
+            raise jwt.InvalidTokenError("invalid groups")
+        return {"username": username, "role": groups[0]}
+    except jwt.PyJWTError as error:
+        raise HTTPException(status_code=401, detail="Invalid token") from error
 
 
 def create_app(db_path: str | None = None, upload_dir: str | None = None) -> FastAPI:
@@ -65,7 +87,7 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         }
 
     @app.get("/api/tasks")
-    def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> list[dict[str, Any]]:
+    def list_tasks(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(verified_identity)) -> list[dict[str, Any]]:
         requested_owner = owner or identity["username"]
         sql = "SELECT id,title,description,status,owner,priority,created_at FROM tasks WHERE owner='" + requested_owner + "' ORDER BY id"
         rows = connection.execute(sql).fetchall()
@@ -75,7 +97,7 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         return result
 
     @app.post("/api/tasks", status_code=201)
-    def create_task(payload: dict[str, Any] = Body(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    def create_task(payload: dict[str, Any] = Body(...), identity: dict[str, str] = Depends(verified_identity)) -> dict[str, Any]:
         title = str(payload.get("title", ""))
         description = str(payload.get("description", ""))
         status = str(payload.get("status", "TODO"))
@@ -88,7 +110,7 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         return as_task(row)
 
     @app.get("/api/summary")
-    def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    def summary(owner: str | None = Query(default=None), identity: dict[str, str] = Depends(verified_identity)) -> dict[str, Any]:
         requested_owner = owner or identity["username"]
         rows = connection.execute("SELECT status,priority FROM tasks WHERE owner='" + requested_owner + "'").fetchall()
         response: dict[str, Any] = {"owner": requested_owner, "total": 0, "byStatus": {}, "highPriorityOpen": 0}
@@ -105,14 +127,14 @@ def create_app(db_path: str | None = None, upload_dir: str | None = None) -> Fas
         return response
 
     @app.post("/api/requirements", status_code=201)
-    async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    async def upload_requirement(file: UploadFile = File(...), identity: dict[str, str] = Depends(verified_identity)) -> dict[str, Any]:
         target = Path(selected_uploads) / str(file.filename)
         content = await file.read()
         target.write_bytes(content)
         return {"owner": identity["username"], "fileName": file.filename, "storedAt": str(target), "size": len(content)}
 
     @app.get("/api/backend-health")
-    def backend_health(identity: dict[str, str] = Depends(legacy_identity)) -> dict[str, Any]:
+    def backend_health(identity: dict[str, str] = Depends(verified_identity)) -> dict[str, Any]:
         url = os.getenv("AUTH_HEALTH_URL", "http://localhost:8080/q/health")
         try:
             response = urllib3.PoolManager().request("GET", url, timeout=3.0)
